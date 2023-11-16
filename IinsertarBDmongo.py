@@ -1,4 +1,4 @@
-import time
+import time as time_module
 import os
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
@@ -6,10 +6,38 @@ import pandas as pd
 import pymongo
 import numpy as np
 
-
 class MyHandler(FileSystemEventHandler):
     def __init__(self, db_collection):
         self.db_collection = db_collection
+
+    def convert_to_valid_dates(self, row):
+        for key, value in row.items():
+            if pd.isna(value):
+                row[key] = None
+            elif isinstance(value, str):
+                try:
+                    row[key] = pd.to_datetime(value)
+                except (ValueError, pd.errors.ParserError):
+                    row[key] = None
+
+    def clean_dataframe(self, df):
+        # Filter out columns with the name "Unnamed"
+        df = df.loc[:, ~df.columns.str.contains('^Unnamed')].copy()
+
+        # Fill in null values appropriately
+        for column in df.columns:
+            if pd.api.types.is_datetime64_any_dtype(df[column]):
+                df.loc[:, column] = df[column].fillna(pd.NaT)
+            else:
+                df.loc[:, column] = df[column].fillna(np.nan)
+
+        # Convert the dates to strings
+        df = df.astype({col: 'str' for col in df.select_dtypes('datetime').columns})
+
+        # Apply the convert_to_valid_dates function to each row
+        df.apply(self.convert_to_valid_dates, axis=1)
+
+        return df
 
     def on_created(self, event):
         print("Archivo detectado")
@@ -17,42 +45,34 @@ class MyHandler(FileSystemEventHandler):
             file_path = os.path.abspath(event.src_path)
             print(f"Nuevo archivo detectado: {file_path}")
 
-            # Lee el archivo Excel en un DataFrame y maneja fechas nulas
-            df = pd.read_excel(file_path, na_values=["", "NULL", "-", "Nan"])
+            # Read the Excel file into a DataFrame and handle null values
+            df = pd.read_excel(file_path, na_values=["", "NULL", "-", "Null"])
 
-            # Rellenar valores nulos de manera adecuada
-            for column in df.columns:
-                if pd.api.types.is_datetime64_any_dtype(df[column]):
-                    df[column].fillna(pd.NaT, inplace=True)
-                else:
-                    df[column].fillna(np.nan, inplace=True)  # Usa np.nan para otros tipos
+            # Clean and preprocess the DataFrame
+            df = self.clean_dataframe(df)
 
-            # Convierte las fechas a strings
-            for column in df.columns:
-                if pd.api.types.is_datetime64_any_dtype(df[column]):
-                    df[column] = df[column].astype(str)
-
-            # Convierte el DataFrame a lista de diccionarios
+            # Convert the DataFrame to a list of dictionaries
             data = df.to_dict(orient="records")
 
-            # Inserta los datos en la colección de MongoDB evitando duplicados
+            # Insert or update the data in the MongoDB collection based on the "#" column
             for row in data:
-                existing_document = self.db_collection.find_one({"id": row["id"]})
-                if existing_document is None:
-                    self.db_collection.insert_one(row)
-                else:
-                    print(f"Documento con id '{row['id']}' ya existe. Omitiendo inserción.")
+                try:
+                    filter_criteria = {"#": row["#"]}
+                    update_data = {"$set": row}
+                    self.db_collection.update_one(filter_criteria, update_data, upsert=True)
+                except pymongo.errors.InvalidDocument:
+                    print(f"Error al insertar el documento con '#' '{row['#']}'. Formato de datos no válido.")
 
-            print(f"Datos insertados (sin duplicados) en MongoDB.")
+            print(f"Datos insertados/actualizados en MongoDB (manejando errores y evitando duplicados).")
 
 
 if __name__ == "__main__":
-    # Configuración de MongoDB
+    # MongoDB configuration
     client = pymongo.MongoClient("localhost", 27017)
-    db = client["permanencias"]
-    collection = db["tramitadas"]
+    db = client["excelBD"]
+    collection = db["coke"]
 
-    # Configuración del observador de eventos
+    # Event observer configuration
     path = r"C:\Users\CETAD\Desktop\data_excel"
     event_handler = MyHandler(collection)
     observer = Observer()
@@ -62,11 +82,11 @@ if __name__ == "__main__":
 
     try:
         while True:
-            time.sleep(10)
+            time_module.sleep(10)  # Use the 'time_module' alias instead of 'time'
     except KeyboardInterrupt:
         observer.stop()
 
     observer.join()
 
-    # Cierra la conexión a MongoDB al finalizar
+    # Close the connection to MongoDB upon termination
     client.close()
